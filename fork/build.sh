@@ -24,5 +24,18 @@ else
 fi
 go build -o "$ROOT/target/lazygit-lazyer" .
 cd "$ROOT"
+# Homebrew's rustup is keg-only, so cargo is often not on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+  for dir in /opt/homebrew/opt/rustup/bin /usr/local/opt/rustup/bin "$HOME/.cargo/bin"; do
+    if [ -x "$dir/cargo" ]; then
+      PATH="$dir:$PATH"
+      break
+    fi
+  done
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found: install Rust (brew install rustup && rustup default stable) or add it to PATH" >&2
+  exit 1
+fi
 cargo build --release -p lazyer
 echo "built target/lazygit-lazyer and target/release/lazyer"
