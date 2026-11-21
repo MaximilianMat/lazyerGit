@@ -1,0 +1,446 @@
+diff --git a/pkg/commands/git_commands/patch.go b/pkg/commands/git_commands/patch.go
+index 39f6047..9daf50a 100644
+--- a/pkg/commands/git_commands/patch.go
++++ b/pkg/commands/git_commands/patch.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/jesseduffield/lazygit/pkg/app/daemon"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/models"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/patch"
++	"github.com/jesseduffield/lazygit/pkg/lazyer"
+ 	"github.com/samber/lo"
+ 	"github.com/stefanhaller/git-todo-parser/todo"
+ )
+@@ -307,6 +308,16 @@ func (self *PatchCommands) MovePatchToSelectedCommit(commits []*models.Commit, s
+ }
+ 
+ func (self *PatchCommands) MovePatchIntoIndex(commits []*models.Commit, commitIdx int, stash bool) error {
++	// A patch made of whole files can be moved by the lazyer daemon without a
++	// rebase. If it declines, carry on as usual.
++	if files, ok := self.PatchBuilder.WholeFilesOnly(); ok && self.PatchBuilder.To == commits[commitIdx].Hash() {
++		args := append([]string{"lazyer-move-patch", commits[commitIdx].Hash()}, files...)
++		if handled, code, _ := lazyer.Exec(self.repoPaths.WorktreePath(), args); handled && code == 0 {
++			self.PatchBuilder.Reset()
++			return nil
++		}
++	}
++
+ 	if stash {
+ 		if err := self.stash.Push(fmt.Sprintf(self.Tr.AutoStashForMovingPatchToIndex, commits[commitIdx].ShortHash())); err != nil {
+ 			return err
+diff --git a/pkg/commands/git_commands/rebase.go b/pkg/commands/git_commands/rebase.go
+index 74278b1..cc642ef 100644
+--- a/pkg/commands/git_commands/rebase.go
++++ b/pkg/commands/git_commands/rebase.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/jesseduffield/lazygit/pkg/app/daemon"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/models"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
++	"github.com/jesseduffield/lazygit/pkg/lazyer"
+ 	"github.com/jesseduffield/lazygit/pkg/utils"
+ 	"github.com/samber/lo"
+ 	"github.com/stefanhaller/git-todo-parser/todo"
+@@ -299,6 +300,12 @@ func (self *RebaseCommands) getHashOfLastCommitMade() (string, error) {
+ func (self *RebaseCommands) AmendTo(commits []*models.Commit, commitIndex int) error {
+ 	commit := commits[commitIndex]
+ 
++	// The lazyer daemon rewrites the commits directly, without a fixup commit
++	// and an interactive rebase. If it declines, carry on as usual.
++	if handled, code, _ := lazyer.Exec(self.repoPaths.WorktreePath(), []string{"lazyer-amend-older", commit.Hash()}); handled && code == 0 {
++		return nil
++	}
++
+ 	if err := self.commit.CreateFixupCommit(commit.Hash()); err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/commands/git_config/get_key.go b/pkg/commands/git_config/get_key.go
+index 7369fa0..55afb19 100644
+--- a/pkg/commands/git_config/get_key.go
++++ b/pkg/commands/git_config/get_key.go
+@@ -8,6 +8,8 @@ import (
+ 	"os/exec"
+ 	"strings"
+ 	"syscall"
++
++	"github.com/jesseduffield/lazygit/pkg/lazyer"
+ )
+ 
+ // including license from https://github.com/tcnksm/go-gitconfig because this file is an adaptation of that repo's code
+@@ -35,6 +37,19 @@ import (
+ // WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ 
+ func runGitConfigCmd(cmd *exec.Cmd) (string, error) {
++	// The lazyer daemon reads the configuration without starting git. If it
++	// declines, carry on as usual.
++	if cmd.Stdin == nil && len(cmd.Args) > 1 && lazyer.Enabled() {
++		if handled, code, out := lazyer.Exec(cmd.Dir, cmd.Args[1:]); handled {
++			if code == 1 {
++				return "", fmt.Errorf("the key is not found for %s", cmd.Args)
++			}
++			if code == 0 {
++				return strings.TrimRight(string(out), "\000"), nil
++			}
++		}
++	}
++
+ 	var stdout bytes.Buffer
+ 	cmd.Stdout = &stdout
+ 	cmd.Stderr = io.Discard
+diff --git a/pkg/commands/oscommands/cmd_obj_runner.go b/pkg/commands/oscommands/cmd_obj_runner.go
+index 6178ac8..7184d79 100644
+--- a/pkg/commands/oscommands/cmd_obj_runner.go
++++ b/pkg/commands/oscommands/cmd_obj_runner.go
+@@ -3,13 +3,16 @@ package oscommands
+ import (
+ 	"bufio"
+ 	"bytes"
++	"fmt"
+ 	"io"
++	"os"
+ 	"os/exec"
+ 	"regexp"
+ 	"strings"
+ 	"time"
+ 
+ 	"github.com/go-errors/errors"
++	"github.com/jesseduffield/lazygit/pkg/lazyer"
+ 	"github.com/jesseduffield/lazygit/pkg/utils"
+ 	"github.com/sasha-s/go-deadlock"
+ 	"github.com/sirupsen/logrus"
+@@ -40,6 +43,9 @@ func (self *cmdObjRunner) Run(cmdObj *CmdObj) error {
+ 	}
+ 
+ 	if cmdObj.ShouldStreamOutput() {
++		if _, err, ok := self.viaLazyerLogged(cmdObj); ok {
++			return err
++		}
+ 		return self.runAndStream(cmdObj)
+ 	}
+ 
+@@ -62,6 +68,9 @@ func (self *cmdObjRunner) RunWithOutput(cmdObj *CmdObj) (string, error) {
+ 	}
+ 
+ 	if cmdObj.ShouldStreamOutput() {
++		if _, err, ok := self.viaLazyerLogged(cmdObj); ok {
++			return "", err
++		}
+ 		err := self.runAndStream(cmdObj)
+ 		// for now we're not capturing output, just because it would take a little more
+ 		// effort and there's currently no use case for it. Some commands call RunWithOutput
+@@ -104,6 +113,10 @@ func (self *cmdObjRunner) RunWithOutputAux(cmdObj *CmdObj) (string, error) {
+ 		self.logCmdObj(cmdObj)
+ 	}
+ 
++	if out, err, ok := self.viaLazyer(cmdObj); ok {
++		return sanitisedCommandOutput(out, err)
++	}
++
+ 	t := time.Now()
+ 	cmd := cmdObj.GetCmd()
+ 	output, err := sanitisedCommandOutput(cmd.CombinedOutput())
+@@ -128,6 +141,11 @@ func (self *cmdObjRunner) RunWithOutputsAux(cmdObj *CmdObj) (string, string, err
+ 		self.logCmdObj(cmdObj)
+ 	}
+ 
++	if out, err, ok := self.viaLazyer(cmdObj); ok {
++		stderr, err := sanitisedCommandOutput(nil, err)
++		return string(out), stderr, err
++	}
++
+ 	t := time.Now()
+ 	var outBuffer, errBuffer bytes.Buffer
+ 	cmd := cmdObj.GetCmd()
+@@ -159,6 +177,21 @@ func (self *cmdObjRunner) RunAndProcessLines(cmdObj *CmdObj, onLine func(line st
+ 	if cmdObj.ShouldLog() {
+ 		self.logCmdObj(cmdObj)
+ 	}
++	if out, _, ok := self.viaLazyer(cmdObj); ok {
++		scanner := bufio.NewScanner(bytes.NewReader(out))
++		scanner.Split(utils.ScanLinesAndTruncateWhenLongerThanBuffer(bufio.MaxScanTokenSize))
++		for scanner.Scan() {
++			stop, err := onLine(scanner.Text())
++			if err != nil {
++				return err
++			}
++			if stop {
++				break
++			}
++		}
++		return scanner.Err()
++	}
++
+ 	t := time.Now()
+ 
+ 	cmd := cmdObj.GetCmd()
+@@ -198,6 +231,79 @@ func (self *cmdObjRunner) RunAndProcessLines(cmdObj *CmdObj, onLine func(line st
+ 	return nil
+ }
+ 
++// Environment variables that change what a git command does in ways the
++// lazyer daemon does not know about. A command carrying one of the first
++// group always runs with git; one of the second group only when lazygit added
++// it to this command (inherited from our own environment, it applies to every
++// command alike and matters to none of the commands the daemon answers).
++var (
++	lazyerDeclinedEnv = []string{
++		"GIT_INDEX_FILE=", "GIT_DIR=", "GIT_WORK_TREE=", "GIT_NAMESPACE=", "GIT_OBJECT_DIRECTORY=",
++		"GIT_AUTHOR_", "GIT_COMMITTER_",
++	}
++	lazyerDeclinedIfAddedEnv = []string{"GIT_SEQUENCE_EDITOR=", "GIT_EDITOR=", "LAZYGIT_DAEMON_"}
++)
++
++// viaLazyer offers a git command to the lazyer daemon. When ok is true the
++// command was answered there: out is what git would have written to stdout,
++// and err is non-nil when git would have exited with a non-zero status.
++func (self *cmdObjRunner) viaLazyer(cmdObj *CmdObj) (out []byte, err error, ok bool) {
++	if !lazyer.Enabled() {
++		return nil, nil, false
++	}
++	cmd := cmdObj.GetCmd()
++	args := cmd.Args
++	if len(args) < 2 || args[0] != "git" || cmd.Stdin != nil {
++		return nil, nil, false
++	}
++	var inherited map[string]bool
++	for _, v := range cmd.Env {
++		for _, declined := range lazyerDeclinedEnv {
++			if strings.HasPrefix(v, declined) {
++				return nil, nil, false
++			}
++		}
++		for _, declined := range lazyerDeclinedIfAddedEnv {
++			if strings.HasPrefix(v, declined) {
++				if inherited == nil {
++					inherited = map[string]bool{}
++					for _, e := range os.Environ() {
++						inherited[e] = true
++					}
++				}
++				if !inherited[v] {
++					return nil, nil, false
++				}
++			}
++		}
++	}
++	t := time.Now()
++	handled, code, stdout := lazyer.Exec(cmd.Dir, args[1:])
++	if !handled {
++		return nil, nil, false
++	}
++	self.log.Infof("%s (lazyer %s)", cmdObj.ToString(), time.Since(t))
++	if code != 0 {
++		return stdout, fmt.Errorf("exit status %d", code), true
++	}
++	return stdout, nil, true
++}
++
++// viaLazyerLogged is viaLazyer for the paths that would otherwise stream the
++// command's output: the command still shows up in the command log.
++func (self *cmdObjRunner) viaLazyerLogged(cmdObj *CmdObj) ([]byte, error, bool) {
++	out, err, ok := self.viaLazyer(cmdObj)
++	if ok {
++		if cmdObj.ShouldLog() {
++			self.logCmdObj(cmdObj)
++		}
++		if err != nil {
++			_, err = sanitisedCommandOutput(out, err)
++		}
++	}
++	return out, err, ok
++}
++
+ func (self *cmdObjRunner) logCmdObj(cmdObj *CmdObj) {
+ 	self.guiIO.logCommandFn(cmdObj.ToString(), true)
+ }
+diff --git a/pkg/commands/patch/patch_builder.go b/pkg/commands/patch/patch_builder.go
+index 71c6972..fd9b54c 100644
+--- a/pkg/commands/patch/patch_builder.go
++++ b/pkg/commands/patch/patch_builder.go
+@@ -548,6 +548,26 @@ func (p *PatchBuilder) NewPatchRequired(from string, to string, reverse bool) bo
+ 	return from != p.From || to != p.To || reverse != p.reverse
+ }
+ 
++// WholeFilesOnly returns the files of the patch when each of them is included
++// as a whole: no line selections and no renames. ok is false otherwise, or
++// when the patch is empty.
++func (p *PatchBuilder) WholeFilesOnly() (files []string, ok bool) {
++	for name, info := range p.snapshotFileInfoMap() {
++		switch info.mode {
++		case UNSELECTED:
++		case WHOLE:
++			if info.previousPath != "" {
++				return nil, false
++			}
++			files = append(files, name)
++		default:
++			return nil, false
++		}
++	}
++	sort.Strings(files)
++	return files, len(files) > 0
++}
++
+ func (p *PatchBuilder) AllFilesInPatch() []string {
+ 	return lo.Keys(p.snapshotFileInfoMap())
+ }
+diff --git a/pkg/lazyer/lazyer.go b/pkg/lazyer/lazyer.go
+new file mode 100644
+index 0000000..f6c730b
+--- /dev/null
++++ b/pkg/lazyer/lazyer.go
+@@ -0,0 +1,156 @@
++// Package lazyer lets lazygit ask the lazyer daemon for the result of a git
++// command instead of starting git. The daemon answers only command lines it
++// reproduces exactly; everything else is declined and runs as before.
++//
++// Set LAZYER=0 to switch this off, LAZYER_BIN to the daemon binary (default:
++// "lazyer" on PATH) and LAZYER_SOCKET to its socket (default:
++// ~/.cache/lazyer/daemon.sock).
++package lazyer
++
++import (
++	"encoding/binary"
++	"io"
++	"net"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++)
++
++var (
++	setup      sync.Once
++	enabled    bool
++	socketPath string
++	binPath    string
++
++	spawnMu   sync.Mutex
++	lastSpawn time.Time
++	failures  atomic.Int32
++)
++
++// After this many consecutive failures to reach the daemon it is left alone
++// for the rest of the session.
++const maxFailures = 3
++
++func initialise() {
++	if os.Getenv("LAZYER") == "0" {
++		return
++	}
++	socketPath = os.Getenv("LAZYER_SOCKET")
++	if socketPath == "" {
++		home, err := os.UserHomeDir()
++		if err != nil {
++			return
++		}
++		socketPath = filepath.Join(home, ".cache", "lazyer", "daemon.sock")
++	}
++	binPath = os.Getenv("LAZYER_BIN")
++	if binPath == "" {
++		if found, err := exec.LookPath("lazyer"); err == nil {
++			binPath = found
++		}
++	}
++	enabled = true
++}
++
++// Enabled reports whether git commands are offered to the daemon.
++func Enabled() bool {
++	setup.Do(initialise)
++	return enabled && failures.Load() < maxFailures
++}
++
++func dial() (net.Conn, error) {
++	conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
++	if err == nil {
++		return conn, nil
++	}
++	if binPath == "" {
++		return nil, err
++	}
++	// Start the daemon, at most once every few seconds, and wait for it.
++	spawnMu.Lock()
++	defer spawnMu.Unlock()
++	if conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond); err == nil {
++		return conn, nil
++	}
++	if time.Since(lastSpawn) < 5*time.Second {
++		return nil, err
++	}
++	lastSpawn = time.Now()
++	_ = os.MkdirAll(filepath.Dir(socketPath), 0o755)
++	cmd := exec.Command(binPath, "daemon")
++	cmd.Env = append(os.Environ(), "LAZYER_SOCKET="+socketPath)
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	if logFile, lerr := os.OpenFile(socketPath[:len(socketPath)-len(filepath.Ext(socketPath))]+".log", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); lerr == nil {
++		cmd.Stderr = logFile
++		defer logFile.Close()
++	}
++	if serr := cmd.Start(); serr != nil {
++		return nil, serr
++	}
++	go func() { _ = cmd.Wait() }()
++	deadline := time.Now().Add(2 * time.Second)
++	for time.Now().Before(deadline) {
++		if conn, derr := net.DialTimeout("unix", socketPath, 100*time.Millisecond); derr == nil {
++			return conn, nil
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	return nil, err
++}
++
++// Exec asks the daemon for the result of `git <args>` run in dir. When
++// handled is false the command has to be run with git; nothing was changed.
++func Exec(dir string, args []string) (handled bool, exitCode int, stdout []byte) {
++	if !Enabled() || len(args) == 0 {
++		return false, 0, nil
++	}
++	if dir == "" {
++		wd, err := os.Getwd()
++		if err != nil {
++			return false, 0, nil
++		}
++		dir = wd
++	}
++	conn, err := dial()
++	if err != nil {
++		failures.Add(1)
++		return false, 0, nil
++	}
++	defer conn.Close()
++	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
++
++	size := len(dir)
++	for _, a := range args {
++		size += 1 + len(a)
++	}
++	frame := make([]byte, 4, 4+size)
++	binary.BigEndian.PutUint32(frame, uint32(size))
++	frame = append(frame, dir...)
++	for _, a := range args {
++		frame = append(frame, 0)
++		frame = append(frame, a...)
++	}
++	if _, err := conn.Write(frame); err != nil {
++		failures.Add(1)
++		return false, 0, nil
++	}
++	var head [9]byte
++	if _, err := io.ReadFull(conn, head[:]); err != nil {
++		failures.Add(1)
++		return false, 0, nil
++	}
++	out := make([]byte, binary.BigEndian.Uint32(head[5:9]))
++	if _, err := io.ReadFull(conn, out); err != nil {
++		failures.Add(1)
++		return false, 0, nil
++	}
++	failures.Store(0)
++	if head[0] != 1 {
++		return false, 0, nil
++	}
++	return true, int(int32(binary.BigEndian.Uint32(head[1:5]))), out
++}

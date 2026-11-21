@@ -38,7 +38,13 @@ pub trait Objects: Sync {
 }
 
 pub fn hex(oid: &Oid) -> String {
-    oid.iter().map(|b| format!("{b:02x}")).collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(40);
+    for b in oid {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 15) as usize] as char);
+    }
+    out
 }
 
 pub fn unhex(s: &str) -> Result<Oid> {
@@ -46,9 +52,17 @@ pub fn unhex(s: &str) -> Result<Oid> {
     if b.len() != 40 {
         bail!("not an object id: {s}");
     }
+    let digit = |c: u8| -> Result<u8> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => bail!("not an object id: {s}"),
+        }
+    };
     let mut oid = [0u8; 20];
     for (i, o) in oid.iter_mut().enumerate() {
-        *o = u8::from_str_radix(std::str::from_utf8(&b[i * 2..i * 2 + 2])?, 16).with_context(|| format!("not an object id: {s}"))?;
+        *o = digit(b[i * 2])? << 4 | digit(b[i * 2 + 1])?;
     }
     Ok(oid)
 }

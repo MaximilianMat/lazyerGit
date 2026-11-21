@@ -3,6 +3,7 @@
 
 pub mod checkout;
 pub mod commitobj;
+pub mod emu;
 pub mod index;
 pub mod odb;
 pub mod ops;
@@ -25,12 +26,21 @@ struct Shared {
     settings: Settings,
     /// For configuration lookups (upstreams, ignore settings).
     repo: gix::ThreadSafeRepository,
+    memo: view::Memo,
     /// Modification times of the config files this was built from.
     config_stamp: Vec<Option<std::time::SystemTime>>,
 }
 
 fn config_stamp(l: &Layout) -> Vec<Option<std::time::SystemTime>> {
-    [l.common_dir.join("config"), l.git_dir.join("config.worktree")].iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect()
+    // The repository's files and the usual places of the user's own. Files
+    // pulled in through `include` are not watched.
+    let mut files = vec![l.common_dir.join("config"), l.git_dir.join("config.worktree")];
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        files.push(home.join(".gitconfig"));
+        files.push(std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config")).join("git").join("config"));
+    }
+    files.push(PathBuf::from("/etc/gitconfig"));
+    files.iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect()
 }
 
 pub struct Native {
@@ -67,7 +77,8 @@ impl Native {
         let opts = if self.isolated { gix::open::Options::isolated() } else { gix::open::Options::default() };
         let repo = gix::open_opts(&l.worktree, opts).map_err(|e| anyhow::anyhow!("opening {}: {e}", l.worktree.display()))?;
         let settings = Self::read_settings(l, &repo);
-        let shared = Arc::new(Shared { odb: odb::GixOdb::open(&l.common_dir)?, settings, repo: repo.into_sync(), config_stamp: stamp });
+        let shared =
+            Arc::new(Shared { odb: odb::GixOdb::open(&l.common_dir)?, settings, repo: repo.into_sync(), memo: Default::default(), config_stamp: stamp });
         self.repos.lock().unwrap().insert(l.common_dir.clone(), shared.clone());
         Ok(shared)
     }
@@ -150,10 +161,10 @@ impl Native {
         if let refs::Head::Branch(name, tip) = &head {
             st.branch = Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_string());
             let repo = shared.repo.to_thread_local();
-            if let Some(up) = Self::upstream_of(&repo, name) {
+            if let Some(up) = shared.memo.upstream(name, || Self::upstream_of(&repo, name)) {
                 st.upstream = Some(view::short_upstream(&up));
                 if let (Some(tip), Some(up_oid)) = (tip, refs::resolve(&r.l, &up)?) {
-                    st.ahead_behind = Some(view::Commits::new(r.odb, &r.l.common_dir).ahead_behind(tip, &up_oid)?);
+                    st.ahead_behind = Some(view::Commits::new(r.odb, &r.l.common_dir).with_memo(&shared.memo).ahead_behind(tip, &up_oid)?);
                 }
             }
         }
@@ -172,7 +183,7 @@ impl Native {
     fn view_rest(&self, r: &Repo, shared: &Shared) -> Result<RepoView> {
         let head = refs::read_head(&r.l)?;
         let repo = shared.repo.to_thread_local();
-        let commits = view::Commits::new(r.odb, &r.l.common_dir);
+        let commits = view::Commits::new(r.odb, &r.l.common_dir).with_memo(&shared.memo);
         let short = |prefix: &str| -> Result<Vec<(String, String)>> {
             Ok(view::list_refs(&r.l, prefix)?.into_iter().map(|(n, o)| (n[prefix.len()..].to_string(), tree::hex(&o))).collect())
         };
@@ -182,7 +193,7 @@ impl Native {
         };
         Ok(RepoView {
             status: Status::default(),
-            branches: view::branches(&r.l, &commits, &head, &|name| Self::upstream_of(&repo, name))?,
+            branches: view::branches(&r.l, &commits, &head, &|name| shared.memo.upstream(name, || Self::upstream_of(&repo, name)))?,
             remote_branches: short("refs/remotes/")?,
             tags: short("refs/tags/")?,
             commits: log,

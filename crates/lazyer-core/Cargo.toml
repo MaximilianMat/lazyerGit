@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 gix = { version = "0.90.0", default-features = false, features = ["index", "max-performance", "parallel", "revision", "sha1", "status"] }
+libc = "0.2.191"
 rayon = "1.12.0"

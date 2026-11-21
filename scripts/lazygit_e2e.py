@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH = os.path.join(ROOT, "target", "release", "lazyer-bench")
 QUIET = 0.35  # seconds without output or git activity that count as idle
+LAZYGIT_BIN = "lazygit"
 
 CONFIG = """git:
   autoFetch: false
@@ -63,7 +64,7 @@ class Lazygit:
         if self.pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 160, 0, 0))
             os.chdir(cwd)
-            os.execvpe("lazygit", ["lazygit"], env)
+            os.execvpe(LAZYGIT_BIN, [LAZYGIT_BIN], env)
         self.trace_pos = 0
         self.trace_buf = b""
         self.running = set()
@@ -72,6 +73,7 @@ class Lazygit:
         self.git_ms = 0.0
         self.screen = b""
         self.cpu_seen = {}
+        self.out_bytes = 0
 
     def pump(self, timeout=0.02):
         r, _, _ = select.select([self.fd], [], [], timeout)
@@ -82,6 +84,7 @@ class Lazygit:
                 data = b""
             if data:
                 self.last_activity = time.time()
+                self.out_bytes += len(data)
                 self.screen = (self.screen + data)[-200000:]
                 if b"\x1b]11;?" in data:
                     os.write(self.fd, b"\x1b]11;rgb:0000/0000/0000\x1b\\")
@@ -112,11 +115,20 @@ class Lazygit:
                 self.git_ms += ev.get("t_abs", 0) * 1000
                 self.last_activity = max(self.last_activity, trace_time(ev["time"]))
 
-    def settle(self, max_wait=120.0):
-        """Wait until idle; returns the time of the last activity."""
-        deadline = time.time() + max_wait
+    def settle(self, max_wait=120.0, after_bytes=-1):
+        """Wait until idle; returns the time of the last activity.
+
+        Idle is only declared once the terminal has shown something beyond
+        `after_bytes` (the output counter when the key was sent): work done
+        inside the process, without a git child, is otherwise invisible. If
+        nothing appears for a few seconds, the action had no visible effect.
+        """
+        started = time.time()
+        deadline = started + max_wait
         while time.time() < deadline:
             self.pump()
+            if self.out_bytes <= after_bytes and time.time() - started < 4.0:
+                continue
             if self.running and time.time() - self.last_activity > QUIET:
                 self.forget_dead()
             if not self.running and time.time() - self.last_activity > QUIET:
@@ -145,22 +157,19 @@ class Lazygit:
 
     def keys(self, data, pause=0.15):
         """Send keys that only move the UI, then wait for it."""
+        before = self.out_bytes
         os.write(self.fd, data.encode())
         time.sleep(pause)
-        self.settle()
+        self.settle(after_bytes=before)
 
     def measure(self, data):
         """Send the confirming key; milliseconds until idle, git processes, git time."""
         self.settle()
-        count0, ms0 = self.git_count, self.git_ms
+        count0, ms0, before = self.git_count, self.git_ms, self.out_bytes
         t0 = time.time()
         self.last_activity = t0
         os.write(self.fd, data.encode())
-        # Give lazygit a moment to react before idle can be declared.
-        end = t0 + 0.05
-        while time.time() < end:
-            self.pump()
-        done = self.settle()
+        done = self.settle(after_bytes=before)
         return (done - t0) * 1000, self.git_count - count0, self.git_ms - ms0
 
     def text(self):
@@ -253,7 +262,10 @@ def main():
     ap.add_argument("--filter", default="")
     ap.add_argument("--shim", action="store_true", help="let lazygit use /usr/bin/git instead of the real binary")
     ap.add_argument("--debug", action="store_true", help="print the terminal text after each run")
+    ap.add_argument("--bin", default="lazygit", help="the lazygit binary to drive, e.g. target/lazygit-lazyer")
     a = ap.parse_args()
+    global LAZYGIT_BIN
+    LAZYGIT_BIN = os.path.abspath(a.bin) if os.sep in a.bin else a.bin
 
     real_git_dir = None
     if not a.shim:
@@ -262,7 +274,7 @@ def main():
         except (OSError, subprocess.CalledProcessError):
             pass
 
-    print(f"profile: {a.profile}   iterations: {a.iters}   git: {'shim' if a.shim else 'real binary'}")
+    print(f"binary: {a.bin}   profile: {a.profile}   iterations: {a.iters}   git: {'shim' if a.shim else 'real binary'}")
     print("ms = confirming key until lazygit is idle; for startup: launch until idle\n")
     print(f"| {'scenario':<24} | {'ms':>8} | {'git procs':>9} | {'git ms sum':>10} | {'head moved':>10} |")
     print(f"|{'-'*26}|{'-'*10}|{'-'*11}|{'-'*12}|{'-'*12}|")
@@ -279,7 +291,7 @@ def main():
             before = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD")
             lg = Lazygit(wt, real_git_dir)
             try:
-                idle = lg.settle()
+                idle = lg.settle(after_bytes=0)
                 if drive is drive_startup:
                     rows.append(((idle - lg.launched) * 1000, lg.git_count, lg.git_ms))
                 else:

@@ -107,15 +107,49 @@ pub fn resolve(l: &Layout, name: &str) -> Result<Option<Oid>> {
     bail!("symbolic ref loop at {name}")
 }
 
-fn packed_lookup(l: &Layout, name: &str) -> Result<Option<Oid>> {
-    let Ok(data) = std::fs::read(l.common_dir.join("packed-refs")) else { return Ok(None) };
-    let needle = name.as_bytes();
-    for line in data.split(|b| *b == b'\n') {
-        if line.len() == 41 + needle.len() && line[40] == b' ' && &line[41..] == needle {
-            return Ok(Some(unhex(std::str::from_utf8(&line[..40])?)?));
+/// `packed-refs`, parsed once per version of the file.
+pub struct Packed {
+    /// Sorted by name.
+    pub refs: Vec<(String, Oid)>,
+}
+
+pub fn packed(l: &Layout) -> std::sync::Arc<Packed> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Stamp = (i64, i64, u64, u64);
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, (Stamp, Arc<Packed>)>>> = OnceLock::new();
+    let path = l.common_dir.join("packed-refs");
+    let Ok(meta) = std::fs::metadata(&path) else { return Arc::new(Packed { refs: Vec::new() }) };
+    let stamp = (meta.mtime(), meta.mtime_nsec(), meta.size(), meta.ino());
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((s, p)) = cache.lock().unwrap().get(&path) {
+        if *s == stamp {
+            return p.clone();
         }
     }
-    Ok(None)
+    let mut refs = Vec::new();
+    if let Ok(data) = std::fs::read(&path) {
+        for line in data.split(|b| *b == b'\n') {
+            if line.len() > 41 && line[40] == b' ' && line[0] != b'#' {
+                if let (Ok(id), Ok(name)) = (std::str::from_utf8(&line[..40]), std::str::from_utf8(&line[41..])) {
+                    if let Ok(oid) = unhex(id) {
+                        refs.push((name.to_string(), oid));
+                    }
+                }
+            }
+        }
+    }
+    if !refs.windows(2).all(|w| w[0].0 < w[1].0) {
+        refs.sort();
+    }
+    let packed = Arc::new(Packed { refs });
+    cache.lock().unwrap().insert(path, (stamp, packed.clone()));
+    packed
+}
+
+fn packed_lookup(l: &Layout, name: &str) -> Result<Option<Oid>> {
+    let packed = packed(l);
+    Ok(packed.refs.binary_search_by(|(n, _)| n.as_str().cmp(name)).ok().map(|i| packed.refs[i].1))
 }
 
 fn reflog_line(old: Option<&Oid>, new: &Oid, who: &Ident, message: &str) -> String {

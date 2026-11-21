@@ -9,19 +9,16 @@ use crate::api::{BranchInfo, CommitInfo, Result, StashInfo, WorktreeInfo};
 use anyhow::Context;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// All refs below `prefix` (`refs/heads/`), name to target id. Loose refs
 /// override packed ones. Annotated tags keep the id of the tag object.
 pub fn list_refs(l: &Layout, prefix: &str) -> Result<BTreeMap<String, Oid>> {
     let mut out = BTreeMap::new();
-    if let Ok(data) = std::fs::read(l.common_dir.join("packed-refs")) {
-        for line in data.split(|b| *b == b'\n') {
-            if line.len() > 41 && line[40] == b' ' && line[41..].starts_with(prefix.as_bytes()) {
-                if let (Ok(id), Ok(name)) = (std::str::from_utf8(&line[..40]), std::str::from_utf8(&line[41..])) {
-                    out.insert(name.to_string(), unhex(id)?);
-                }
-            }
-        }
+    let packed = refs::packed(l);
+    let start = packed.refs.partition_point(|(n, _)| n.as_str() < prefix);
+    for (name, oid) in packed.refs[start..].iter().take_while(|(n, _)| n.starts_with(prefix)) {
+        out.insert(name.clone(), *oid);
     }
     loose(l, &l.common_dir.join(prefix.trim_end_matches('/')), prefix.trim_end_matches('/'), &mut out)?;
     Ok(out)
@@ -45,11 +42,46 @@ fn loose(l: &Layout, dir: &Path, name: &str, out: &mut BTreeMap<String, Oid>) ->
     Ok(())
 }
 
+/// Facts about objects that can never change, kept for as long as the
+/// repository is open: commits, distances between two commits, the order of
+/// history below a commit, what a tag points to, and (until the configuration
+/// changes) which ref a branch tracks.
+#[derive(Default)]
+pub struct Memo {
+    commits: Mutex<HashMap<Oid, Arc<RawCommit>>>,
+    ahead_behind: Mutex<HashMap<(Oid, Oid), (u32, u32)>>,
+    topo: Mutex<Vec<((Oid, usize), Arc<Vec<Oid>>)>>,
+    peeled: Mutex<HashMap<Oid, Oid>>,
+    upstream: Mutex<HashMap<String, Option<String>>>,
+}
+
+impl Memo {
+    pub fn upstream(&self, branch_ref: &str, find: impl FnOnce() -> Option<String>) -> Option<String> {
+        if let Some(u) = self.upstream.lock().unwrap().get(branch_ref) {
+            return u.clone();
+        }
+        let u = find();
+        self.upstream.lock().unwrap().insert(branch_ref.to_string(), u.clone());
+        u
+    }
+
+    /// The object an annotated tag finally points to.
+    pub fn peeled(&self, tag: &Oid, find: impl FnOnce() -> Result<Oid>) -> Result<Oid> {
+        if let Some(t) = self.peeled.lock().unwrap().get(tag) {
+            return Ok(*t);
+        }
+        let t = find()?;
+        self.peeled.lock().unwrap().insert(*tag, t);
+        Ok(t)
+    }
+}
+
 /// Parents, generation and commit time, from the commit-graph when the
 /// commit is in it, otherwise from the object.
 pub struct Commits<'a> {
     pub odb: &'a dyn Objects,
     pub graph: Option<gix::commitgraph::Graph>,
+    memo: Option<&'a Memo>,
     cache: std::cell::RefCell<HashMap<Oid, std::rc::Rc<Node>>>,
 }
 
@@ -63,13 +95,25 @@ pub struct Node {
 impl<'a> Commits<'a> {
     pub fn new(odb: &'a dyn Objects, common_dir: &Path) -> Self {
         let graph = gix::commitgraph::Graph::from_info_dir(&common_dir.join("objects").join("info"), gix::hash::Kind::Sha1).ok();
-        Commits { odb, graph, cache: Default::default() }
+        Commits { odb, graph, memo: None, cache: Default::default() }
     }
 
-    pub fn raw(&self, oid: &Oid) -> Result<RawCommit> {
+    pub fn with_memo(mut self, memo: &'a Memo) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    pub fn raw(&self, oid: &Oid) -> Result<Arc<RawCommit>> {
+        if let Some(c) = self.memo.and_then(|m| m.commits.lock().unwrap().get(oid).cloned()) {
+            return Ok(c);
+        }
         let (kind, data) = self.odb.read(oid)?;
         anyhow::ensure!(kind == Kind::Commit, "{} is not a commit", hex(oid));
-        RawCommit::parse(&data)
+        let c = Arc::new(RawCommit::parse(&data)?);
+        if let Some(m) = self.memo {
+            m.commits.lock().unwrap().insert(*oid, c.clone());
+        }
+        Ok(c)
     }
 
     pub fn node(&self, oid: &Oid) -> Result<std::rc::Rc<Node>> {
@@ -104,6 +148,9 @@ impl<'a> Commits<'a> {
         if local == upstream {
             return Ok((0, 0));
         }
+        if let Some(r) = self.memo.and_then(|m| m.ahead_behind.lock().unwrap().get(&(*local, *upstream)).copied()) {
+            return Ok(r);
+        }
         const LOCAL: u8 = 1;
         const UPSTREAM: u8 = 2;
         const BOTH: u8 = 3;
@@ -128,13 +175,33 @@ impl<'a> Commits<'a> {
         }
         let ahead = flags.values().filter(|f| **f == LOCAL).count() as u32;
         let behind = flags.values().filter(|f| **f == UPSTREAM).count() as u32;
+        if let Some(m) = self.memo {
+            m.ahead_behind.lock().unwrap().insert((*local, *upstream), (ahead, behind));
+        }
         Ok((ahead, behind))
     }
 
     /// The first `limit` commits of `git log --topo-order` from `start`:
     /// a commit is shown only after all its children, and after a merge the
     /// history of its last parent comes first.
-    pub fn topo_log(&self, start: &Oid, limit: usize) -> Result<Vec<Oid>> {
+    pub fn topo_log(&self, start: &Oid, limit: usize) -> Result<Arc<Vec<Oid>>> {
+        if let Some(m) = self.memo {
+            if let Some((_, v)) = m.topo.lock().unwrap().iter().find(|(k, _)| *k == (*start, limit)) {
+                return Ok(v.clone());
+            }
+        }
+        let out = Arc::new(self.topo_log_uncached(start, limit)?);
+        if let Some(m) = self.memo {
+            let mut topo = m.topo.lock().unwrap();
+            if topo.len() >= 16 {
+                topo.remove(0);
+            }
+            topo.push(((*start, limit), out.clone()));
+        }
+        Ok(out)
+    }
+
+    fn topo_log_uncached(&self, start: &Oid, limit: usize) -> Result<Vec<Oid>> {
         let mut indegree: HashMap<Oid, u32> = HashMap::new();
         let mut seen: HashSet<Oid> = HashSet::from([*start]);
         // Commits whose parents still have to be counted, highest generation first.
@@ -171,7 +238,7 @@ impl<'a> Commits<'a> {
     }
 }
 
-fn ident_time(ident: &[u8]) -> i64 {
+pub fn ident_time(ident: &[u8]) -> i64 {
     let text = String::from_utf8_lossy(ident);
     let mut parts = text.rsplitn(3, ' ');
     let _tz = parts.next();
@@ -179,7 +246,7 @@ fn ident_time(ident: &[u8]) -> i64 {
 }
 
 /// `%s`: the first paragraph of the message on one line.
-fn subject(message: &[u8]) -> String {
+pub fn subject(message: &[u8]) -> String {
     let text = String::from_utf8_lossy(message);
     let mut lines = text.lines().skip_while(|l| l.trim().is_empty()).take_while(|l| !l.trim().is_empty());
     let mut out = lines.next().unwrap_or("").trim_end().to_string();

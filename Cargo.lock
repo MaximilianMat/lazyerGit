@@ -1212,6 +1212,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazyer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lazyer-core",
+]
+
+[[package]]
 name = "lazyer-bench"
 version = "0.1.0"
 dependencies = [
@@ -1226,6 +1234,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gix",
+ "libc",
  "rayon",
 ]
 

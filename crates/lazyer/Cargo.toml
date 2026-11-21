@@ -1,0 +1,8 @@
+[package]
+name = "lazyer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lazyer-core = { path = "../lazyer-core" }
