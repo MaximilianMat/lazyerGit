@@ -8,7 +8,17 @@ The engine performs these operations in-process on the repository files.
 Anything it does not handle itself is declined and handed to real git, so the
 result is always what git would have produced.
 
-## Using it
+## Install
+
+    ./install.sh
+
+builds everything and installs two files, `lazygit` (the fork) and `lazyer`
+(the daemon), into `~/bin` (or `--prefix DIR`). If that directory is not ahead
+of the stock lazygit on your PATH, one marked line is added to your shell
+profile. The stock lazygit is not touched. `./install.sh --uninstall` removes
+the two files and that line again. Needs Go and Rust.
+
+To try a build without installing:
 
     fork/build.sh
     LAZYER_BIN=$PWD/target/release/lazyer target/lazygit-lazyer -p <worktree>

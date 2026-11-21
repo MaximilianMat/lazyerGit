@@ -9,6 +9,7 @@ pub mod odb;
 pub mod ops;
 pub mod refs;
 pub mod similarity;
+pub mod stage;
 pub mod status;
 pub mod tree;
 pub mod view;

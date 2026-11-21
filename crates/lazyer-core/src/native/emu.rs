@@ -11,6 +11,7 @@
 use super::commitobj::RawCommit;
 use super::ops::Repo;
 use super::refs::{self, Head};
+use super::stage;
 use super::tree::{hex, unhex, Kind, Oid};
 use super::view::{self, Commits};
 use super::{Native, Shared};
@@ -79,8 +80,63 @@ impl Native {
             "config" => emu_config(r, shared, rest),
             "reflog" => emu_reflog_show(r, rest),
             "rev-list" => self.emu_rev_list(r, shared, rest),
+            "tag" if rest.first() == Some(&"--") && (rest.len() == 2 || rest.len() == 3) => {
+                // `git tag -- <name> [<ref>]`: a lightweight tag.
+                let Some(target) = resolve_name(r, rest.get(2).copied().unwrap_or("HEAD"))? else { return unsupported("unknown revision") };
+                r.create_tag(rest[1], &target)?;
+                ok("")
+            }
             "tag" => emu_tag_list(r, shared, rest),
-            "checkout" => self.emu_checkout(r, rest),
+            "checkout" => self.emu_checkout(r, shared, rest),
+            "add" => {
+                let (tracked_only, specs) = match rest {
+                    ["-A"] => (false, vec![".".to_string()]),
+                    ["-u"] => (true, vec![".".to_string()]),
+                    ["--", paths @ ..] => (false, stage::literal_specs(paths)?),
+                    ["-u", "--", paths @ ..] => (true, stage::literal_specs(paths)?),
+                    _ => return unsupported("add form"),
+                };
+                let (status, _) = self.status_in(r, shared)?;
+                r.stage(&status.entries, &specs, tracked_only)?;
+                ok("")
+            }
+            "reset" => match rest {
+                [] => r.unstage(None).and_then(|_| ok("")),
+                ["HEAD", "--", paths @ ..] | ["--", paths @ ..] => r.unstage(Some(&stage::literal_specs(paths)?)).and_then(|_| ok("")),
+                [strength @ ("--soft" | "--mixed" | "--hard"), name] => {
+                    let mode = match *strength {
+                        "--soft" => stage::ResetMode::Soft,
+                        "--mixed" => stage::ResetMode::Mixed,
+                        _ => stage::ResetMode::Hard,
+                    };
+                    let Some(target) = resolve_commit(r, name)? else { return unsupported("unknown revision") };
+                    r.reset(mode, &target, name)?;
+                    ok("")
+                }
+                _ => unsupported("reset form"),
+            },
+            "rm" => match rest {
+                ["--cached", "--force", "--", paths @ ..] if !paths.is_empty() => {
+                    r.remove_cached(&stage::literal_specs(paths)?)?;
+                    ok("")
+                }
+                _ => unsupported("rm form"),
+            },
+            "branch" => match rest {
+                // `git branch <name> <base>`: a new branch, not checked out.
+                [name, base] if !name.starts_with('-') && !base.starts_with('-') => {
+                    let target = branch_base(r, shared, base, false)?;
+                    r.create_branch(name, &target, base, false)?;
+                    ok("")
+                }
+                _ => unsupported("branch form"),
+            },
+            "symbolic-ref" => match (rest, refs::read_head(&r.l)?) {
+                (["HEAD"] | ["-q", "HEAD"], Head::Branch(name, _)) => ok(format!("{name}\n")),
+                (["--short", "HEAD"], Head::Branch(name, _)) => ok(format!("{}\n", name.strip_prefix("refs/heads/").unwrap_or(&name))),
+                (["-q", "HEAD"], Head::Detached(_)) => Ok(Emulated { stdout: Vec::new(), code: 1 }),
+                _ => unsupported("symbolic-ref form"),
+            },
             "commit" => self.emu_commit(r, shared, rest),
             // Operations that have no single git command line.
             "lazyer-amend-older" if rest.len() == 1 => {
@@ -93,6 +149,34 @@ impl Native {
                 let paths: Vec<String> = rest[1..].iter().map(|s| s.to_string()).collect();
                 self.move_patch_to_index(&r.l.worktree, rest[0], &paths, &who)?;
                 ok("")
+            }
+            // `git-worktree-swap <branch> [--detach-other]` in one step.
+            // Prints what the script prints.
+            "lazyer-swap-branch" if rest.len() == 1 || (rest.len() == 2 && rest[1] == "--detach-other") => {
+                let (branch, detach) = (rest[0], rest.len() == 2);
+                let refname = format!("refs/heads/{branch}");
+                let here = r.l.worktree.display().to_string();
+                let current = match refs::read_head(&r.l)? {
+                    Head::Branch(name, _) => name.strip_prefix("refs/heads/").map(str::to_string),
+                    Head::Detached(_) => None,
+                };
+                let mut other = None;
+                for (root, git_dir) in refs::worktrees(&r.l)? {
+                    let l = refs::Layout { worktree: root.clone(), git_dir, common_dir: r.l.common_dir.clone() };
+                    if matches!(refs::read_head(&l), Ok(Head::Branch(name, _)) if name == refname) {
+                        other = Some((root, l.git_dir));
+                    }
+                }
+                // Not checked out anywhere else: the script explains and fails.
+                let Some((other_root, other_git_dir)) = other else { return unsupported("branch is not checked out in another worktree") };
+                if other_git_dir == r.l.git_dir {
+                    return ok(format!("Already on {branch}\n"));
+                }
+                self.swap_branch(&r.l.worktree, branch, detach)?;
+                match (current, detach) {
+                    (Some(current), false) => ok(format!("Swapped: {here} -> {branch}, {} -> {current}\n", other_root.display())),
+                    _ => ok(format!("{here} -> {branch}, {} left detached\n", other_root.display())),
+                }
             }
             _ => unsupported("command"),
         }
@@ -129,6 +213,10 @@ impl Native {
     fn emu_rev_parse(&self, r: &Repo, shared: &Shared, rest: &[&str]) -> Result<Emulated> {
         let real = |p: &Path| -> Result<String> { Ok(p.canonicalize()?.to_string_lossy().to_string()) };
         match rest {
+            ["HEAD"] | ["--verify", "HEAD"] => match refs::read_head(&r.l)?.oid() {
+                Some(oid) => ok(format!("{}\n", hex(&oid))),
+                None => unsupported("unborn branch"),
+            },
             ["--path-format=absolute", "--absolute-git-dir"] => ok(format!("{}\n", real(&r.l.git_dir)?)),
             ["--path-format=absolute", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", "--show-superproject-working-tree"] => {
                 if r.l.common_dir.components().any(|c| c.as_os_str() == "modules") {
@@ -507,7 +595,21 @@ impl Native {
     }
 
     /// `git checkout <local branch>`.
-    fn emu_checkout(&self, r: &Repo, rest: &[&str]) -> Result<Emulated> {
+    fn emu_checkout(&self, r: &Repo, shared: &Shared, rest: &[&str]) -> Result<Emulated> {
+        match rest {
+            // `git checkout -- <paths>`: discard unstaged changes.
+            ["--", paths @ ..] if !paths.is_empty() => {
+                r.discard_unstaged(&stage::literal_specs(paths)?)?;
+                return ok("");
+            }
+            // `git checkout -b <name> <base> [--no-track]`: new branch, checked out.
+            ["-b", name, base] | ["-b", name, base, "--no-track"] => {
+                let target = branch_base(r, shared, base, rest.len() == 4)?;
+                r.create_branch(name, &target, base, true)?;
+                return ok("");
+            }
+            _ => {}
+        }
         let [branch] = rest else { return unsupported("checkout form") };
         if branch.starts_with('-') || refs::resolve(&r.l, &format!("refs/heads/{branch}"))?.is_none() {
             return unsupported("not a local branch");
@@ -606,6 +708,43 @@ fn resolve_name(r: &Repo, name: &str) -> Result<Option<Oid>> {
         return unsupported("abbreviated id or pseudo-ref");
     }
     Ok(None)
+}
+
+/// A revision that has to be a commit (an annotated tag is followed).
+fn resolve_commit(r: &Repo, name: &str) -> Result<Option<Oid>> {
+    let Some(mut oid) = resolve_name(r, name)? else { return Ok(None) };
+    for _ in 0..8 {
+        let (kind, data) = r.odb.read(&oid)?;
+        match kind {
+            Kind::Commit => return Ok(Some(oid)),
+            Kind::Tag => {
+                let line = data.split(|b| *b == b'\n').next().unwrap_or_default();
+                oid = unhex(std::str::from_utf8(line.strip_prefix(b"object ").unwrap_or_default())?)?;
+            }
+            _ => return unsupported("not a commit"),
+        }
+    }
+    unsupported("tag chain")
+}
+
+/// The commit a new branch starts at. Starting from a remote-tracking branch
+/// makes git record an upstream in the config (unless told not to), and so
+/// does `branch.autoSetupMerge=always|inherit`; those are left to git.
+fn branch_base(r: &Repo, shared: &Shared, base: &str, no_track: bool) -> Result<Oid> {
+    let repo = shared.repo.to_thread_local();
+    let setup = repo.config_snapshot().string("branch.autoSetupMerge").map(|v| v.to_string().to_ascii_lowercase());
+    if matches!(setup.as_deref(), Some("always" | "inherit" | "simple")) && !no_track {
+        return unsupported("branch.autoSetupMerge");
+    }
+    let is_remote = base.starts_with("refs/remotes/") || refs::resolve(&r.l, &format!("refs/remotes/{base}"))?.is_some();
+    let is_local = refs::resolve(&r.l, &format!("refs/heads/{base}"))?.is_some() || refs::resolve(&r.l, &format!("refs/tags/{base}"))?.is_some();
+    if is_remote && !is_local && !no_track && setup.as_deref() != Some("false") {
+        return unsupported("starting point is a remote-tracking branch");
+    }
+    match resolve_commit(r, base)? {
+        Some(oid) => Ok(oid),
+        None => unsupported("unknown revision"),
+    }
 }
 
 fn short_ref(name: &str) -> &str {

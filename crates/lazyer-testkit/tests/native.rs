@@ -61,3 +61,36 @@ fn native_engine_matches_git() {
     println!("{}", report.join("\n"));
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// The one-step swap the daemon offers to `git-worktree-swap` must leave the
+/// repository exactly as the script's own sequence of git commands does.
+#[test]
+fn swap_command_matches_the_script() {
+    use lazyer_core::Backend;
+    use lazyer_testkit::differential::compared_worktrees;
+    use lazyer_testkit::snapshot::{differences, snapshot};
+    use lazyer_testkit::Fixture;
+
+    let profile = Profile::small();
+    for detach in [false, true] {
+        let (fa, fb) = (Fixture::temp(&profile).unwrap(), Fixture::temp(&profile).unwrap());
+        let branch = lazyer_testkit::git::run(&fa.worktree(1), &["symbolic-ref", "--short", "HEAD"]).unwrap();
+        GitCli::real().swap_branch(&fa.repo, &branch, detach).unwrap();
+
+        let mut argv = vec!["lazyer-swap-branch".to_string(), branch.clone()];
+        if detach {
+            argv.push("--detach-other".into());
+        }
+        let out = Native::isolated().emulate(&fb.repo, &argv).expect("the swap is handled");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert_eq!(out.code, 0);
+        assert!(text.contains(&format!("-> {branch}")) && text.contains(if detach { "left detached" } else { "Swapped:" }), "{text}");
+
+        let a = snapshot(&fa.repo, &compared_worktrees(&profile, &fa)).unwrap();
+        let b = snapshot(&fb.repo, &compared_worktrees(&profile, &fb)).unwrap();
+        assert!(differences(&a, &b).is_empty(), "{:#?}", differences(&a, &b));
+
+        // A branch no other worktree holds is not this command's business.
+        assert!(Native::isolated().emulate(&fb.repo, &["lazyer-swap-branch".to_string(), "no-such-branch".to_string()]).is_none());
+    }
+}

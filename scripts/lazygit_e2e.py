@@ -227,6 +227,16 @@ def drive_commit(lg, args):
     return lg.measure("\r")
 
 
+def drive_stage_file(lg, args):
+    lg.keys("2")        # files panel
+    return lg.measure(" ")  # stage (or unstage) the selected entry
+
+
+def drive_stage_all(lg, args):
+    lg.keys("2")
+    return lg.measure("a")  # stage all
+
+
 def drive_amend_head(lg, args):
     lg.keys("2")
     lg.keys("A")        # amend last commit, asks for confirmation
@@ -248,6 +258,8 @@ SCENARIOS = [
     ("startup_other_worktree", "view_other_worktree", drive_startup),
     ("switch_near", "switch_near", drive_switch),
     ("switch_far", "switch_far", drive_switch),
+    ("stage_file", "status_dirty", drive_stage_file),
+    ("stage_all", "status_dirty", drive_stage_all),
     ("commit_staged", "commit_staged", drive_commit),
     ("amend_head", "amend_head", drive_amend_head),
     ("amend_older_d3", "amend_older_d3", drive_amend_older(3)),
@@ -276,7 +288,7 @@ def main():
 
     print(f"binary: {a.bin}   profile: {a.profile}   iterations: {a.iters}   git: {'shim' if a.shim else 'real binary'}")
     print("ms = confirming key until lazygit is idle; for startup: launch until idle\n")
-    print(f"| {'scenario':<24} | {'ms':>8} | {'git procs':>9} | {'git ms sum':>10} | {'head moved':>10} |")
+    print(f"| {'scenario':<24} | {'ms':>8} | {'git procs':>9} | {'git ms sum':>10} | {'took effect':>10} |")
     print(f"|{'-'*26}|{'-'*10}|{'-'*11}|{'-'*12}|{'-'*12}|")
     for name, prep, drive in SCENARIOS:
         if a.filter and a.filter not in name:
@@ -288,7 +300,7 @@ def main():
             wt, *args = bench("prepare", prep, "--profile", a.profile)
             time.sleep(1.1)
             git(wt, "update-index", "-q", "--refresh", "--force-write-index")
-            before = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD")
+            before = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD") + git(wt, "status", "--porcelain")
             lg = Lazygit(wt, real_git_dir)
             try:
                 idle = lg.settle(after_bytes=0)
@@ -296,7 +308,7 @@ def main():
                     rows.append(((idle - lg.launched) * 1000, lg.git_count, lg.git_ms))
                 else:
                     rows.append(drive(lg, args))
-                    after = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD")
+                    after = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD") + git(wt, "status", "--porcelain")
                     effect = "yes" if after != before else "NO"
                 if a.debug:
                     print(lg.text()[-3000:], file=sys.stderr)

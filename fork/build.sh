@@ -38,4 +38,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 cargo build --release -p lazyer
+# End a running daemon: it still is the previous build. The next request
+# starts the new one.
+"$ROOT/target/release/lazyer" stop >/dev/null 2>&1 || true
 echo "built target/lazygit-lazyer and target/release/lazyer"

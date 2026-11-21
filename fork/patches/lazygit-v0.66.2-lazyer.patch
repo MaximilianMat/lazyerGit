@@ -284,16 +284,16 @@ index 71c6972..fd9b54c 100644
  }
 diff --git a/pkg/lazyer/lazyer.go b/pkg/lazyer/lazyer.go
 new file mode 100644
-index 0000000..f6c730b
+index 0000000..a3c83ea
 --- /dev/null
 +++ b/pkg/lazyer/lazyer.go
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,165 @@
 +// Package lazyer lets lazygit ask the lazyer daemon for the result of a git
 +// command instead of starting git. The daemon answers only command lines it
 +// reproduces exactly; everything else is declined and runs as before.
 +//
 +// Set LAZYER=0 to switch this off, LAZYER_BIN to the daemon binary (default:
-+// "lazyer" on PATH) and LAZYER_SOCKET to its socket (default:
++// "lazyer" next to this executable, else on PATH) and LAZYER_SOCKET to its socket (default:
 +// ~/.cache/lazyer/daemon.sock).
 +package lazyer
 +
@@ -338,6 +338,15 @@ index 0000000..f6c730b
 +		socketPath = filepath.Join(home, ".cache", "lazyer", "daemon.sock")
 +	}
 +	binPath = os.Getenv("LAZYER_BIN")
++	if binPath == "" {
++		// Installed side by side: look next to this executable first.
++		if self, err := os.Executable(); err == nil {
++			sibling := filepath.Join(filepath.Dir(self), "lazyer")
++			if info, serr := os.Stat(sibling); serr == nil && !info.IsDir() {
++				binPath = sibling
++			}
++		}
++	}
 +	if binPath == "" {
 +		if found, err := exec.LookPath("lazyer"); err == nil {
 +			binPath = found

@@ -198,6 +198,14 @@ pub fn update_ref(l: &Layout, name: &str, new: &Oid, expected: Option<&Oid>, who
     append_log(l, name, &reflog_line(expected, new, who, message))
 }
 
+/// Create a ref that must not exist yet, without a reflog (tags have none).
+pub fn create_ref(l: &Layout, name: &str, oid: &Oid) -> Result<()> {
+    if resolve(l, name)?.is_some() {
+        bail!("{name} already exists");
+    }
+    replace_file(&l.ref_file(name), format!("{}\n", hex(oid)).as_bytes())
+}
+
 /// Record a movement of HEAD in its reflog. Used when the checked-out branch
 /// moved or when HEAD itself was repointed.
 pub fn log_head(l: &Layout, old: Option<&Oid>, new: &Oid, who: &Ident, message: &str) -> Result<()> {

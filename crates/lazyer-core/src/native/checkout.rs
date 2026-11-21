@@ -195,7 +195,7 @@ pub fn plan_switch(l: &Layout, odb: &dyn Objects, index: &Index, index_mtime: (u
 /// which costs two directory updates per file; on APFS those dominate a
 /// checkout and do not parallelise. In-place is only taken when the result is
 /// indistinguishable: a regular file, not a symlink, with no other hard link.
-fn write_file(path: &Path, mode: u32, data: &[u8]) -> std::io::Result<std::fs::Metadata> {
+pub(crate) fn write_file(path: &Path, mode: u32, data: &[u8]) -> std::io::Result<std::fs::Metadata> {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
     const O_NOFOLLOW: i32 = 0x0100; // macOS; Linux uses 0o400000

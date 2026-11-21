@@ -47,7 +47,7 @@ impl Repo<'_> {
         Ok((Index::read(&path)?, (meta.mtime() as u32, meta.mtime_nsec() as u32)))
     }
 
-    fn store_index(&self, index: &Index, lock: IndexLock) -> Result<()> {
+    pub(crate) fn store_index(&self, index: &Index, lock: IndexLock) -> Result<()> {
         let mut bytes = index.serialize();
         let checksum = if self.settings.skip_hash && !index.had_checksum { [0u8; 20] } else { sha1(&bytes) };
         bytes.extend_from_slice(&checksum);
@@ -56,7 +56,7 @@ impl Repo<'_> {
 
     /// Hooks run arbitrary programs at defined points; an operation that
     /// would trigger one is git's.
-    fn no_hooks(&self, names: &[&str]) -> Result<()> {
+    pub(crate) fn no_hooks(&self, names: &[&str]) -> Result<()> {
         for name in names {
             if let Ok(meta) = std::fs::metadata(self.settings.hooks_dir.join(name)) {
                 if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
@@ -67,7 +67,7 @@ impl Repo<'_> {
         Ok(())
     }
 
-    fn nothing_in_progress(&self) -> Result<()> {
+    pub(crate) fn nothing_in_progress(&self) -> Result<()> {
         for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG"] {
             if self.l.git_dir.join(name).exists() {
                 return unsupported(format!("{name} in progress"));
@@ -88,13 +88,13 @@ impl Repo<'_> {
         unhex(&self.commit_of(commit)?.tree)
     }
 
-    fn reflog_ident(&self, time: i64) -> Ident {
+    pub(crate) fn reflog_ident(&self, time: i64) -> Ident {
         let (name, email) = self.settings.user.clone().unwrap_or_else(|| ("lazyerGit".into(), "lazyergit@localhost".into()));
         Ident { name, email, time, tz: "+0000".into() }
     }
 
     /// Move the current branch (or a detached HEAD) to `new`.
-    fn move_head(&self, head: &Head, new: &Oid, who: &Ident, message: &str) -> Result<()> {
+    pub(crate) fn move_head(&self, head: &Head, new: &Oid, who: &Ident, message: &str) -> Result<()> {
         match head {
             Head::Branch(name, old) => {
                 refs::update_ref(&self.l, name, new, old.as_ref(), who, message)?;
@@ -403,10 +403,12 @@ impl Repo<'_> {
             Some(current) => Some(there.plan_branch_switch(current, &their_index, their_mtime, &branch_tip)),
             None => None,
         };
+        // If the other worktree cannot take this branch (local changes in
+        // the way, or something that needs git), decline before touching
+        // anything: git then does the swap step by step and reports where
+        // it stopped.
         if let Some(Err(e)) = &plan_there {
-            if e.downcast_ref::<crate::api::Unsupported>().is_some() {
-                return unsupported(format!("other worktree: {e}"));
-            }
+            return unsupported(format!("other worktree: {e}"));
         }
 
         let who = self.reflog_ident(now());
@@ -430,6 +432,6 @@ fn head_name(head: &Head) -> String {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
