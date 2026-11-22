@@ -329,6 +329,8 @@ struct Walk<'a> {
     index: &'a Index,
     case: gix::glob::pattern::Case,
     cache: &'a DirCache,
+    /// `core.precomposeUnicode`: git compares names after normalising them.
+    precompose: bool,
 }
 
 impl Walk<'_> {
@@ -390,6 +392,15 @@ impl Walk<'_> {
                 rel.push(b'/');
                 subdirs.push(rel);
             } else if !tracked_files.contains(name.as_slice()) && !self.ignored(&rules, &rel, false) {
+                // On a case-insensitive or Unicode-normalising file system
+                // git may recognise this as a tracked file under another
+                // spelling. Costs nothing unless such a candidate shows up.
+                if self.case == gix::glob::pattern::Case::Fold && tracked_files.iter().any(|t| t.eq_ignore_ascii_case(name)) {
+                    return unsupported("untracked name differs from a tracked one only in case");
+                }
+                if self.precompose && !name.is_ascii() {
+                    return unsupported("untracked non-ASCII name");
+                }
                 out.push(rel);
             }
         }
@@ -412,6 +423,7 @@ pub struct StatusInput<'a> {
     /// `info/exclude` and the user's global excludes file.
     pub base_rules: gix::ignore::Search,
     pub ignore_case: bool,
+    pub precompose_unicode: bool,
     pub dir_cache: &'a DirCache,
 }
 
@@ -425,7 +437,7 @@ pub fn entries(input: &StatusInput) -> Result<Vec<StatusEntry>> {
         return unsupported("skip-worktree entries");
     }
     let case = if input.ignore_case { gix::glob::pattern::Case::Fold } else { gix::glob::pattern::Case::Sensitive };
-    let walk = Walk { root: input.root, index, case, cache: input.dir_cache };
+    let walk = Walk { root: input.root, index, case, cache: input.dir_cache, precompose: input.precompose_unicode };
     let rules: Rules = Arc::new(input.base_rules.clone());
 
     let (staged, (unstaged, untracked)) = rayon::join(

@@ -51,6 +51,13 @@ pub fn all() -> Vec<Scenario> {
             run: run_status_twice,
             must_fail: false,
         },
+        Scenario {
+            name: "status_two_hunks",
+            about: "status with one file changed at its top and at its bottom",
+            prepare: prep_two_hunks,
+            run: run_status,
+            must_fail: false,
+        },
         Scenario { name: "view_main", about: "everything the UI shows for the main worktree", prepare: |fx| ctx(fx, &[]), run: run_view, must_fail: false },
         Scenario {
             name: "view_other_worktree",
@@ -235,6 +242,21 @@ fn prep_rename(fx: &Fixture) -> Result<Ctx> {
     append(wt, "renamed-edited.java", "a small edit after the rename\n")?;
     add(wt, &["renamed-edited.java".to_string()])?;
     ctx(fx, &[])
+}
+
+/// One tracked file with its first and last line changed: two hunks, the
+/// start state for staging single hunks and lines.
+fn prep_two_hunks(fx: &Fixture) -> Result<Ctx> {
+    let wt = &fx.repo;
+    let all: Vec<String> = run(wt, &["ls-files", "--", "*.java"])?.lines().map(str::to_string).collect();
+    let file = all.iter().find(|f| std::fs::read_to_string(wt.join(f)).is_ok_and(|t| t.lines().count() >= 14)).context("no file with enough lines")?;
+    let text = std::fs::read_to_string(wt.join(file))?;
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let last = lines.len() - 1;
+    lines[0] = "first line changed".into();
+    lines[last] = "last line changed".into();
+    std::fs::write(wt.join(file), lines.join("\n") + "\n")?;
+    ctx(fx, &[file.clone()])
 }
 
 fn prep_other_worktree(fx: &Fixture) -> Result<Ctx> {

@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The daemon ends itself after this long without a request.
 const IDLE_EXIT: Duration = Duration::from_secs(8 * 3600);
+/// Larger requests than any git command line are refused.
+const MAX_REQUEST: usize = 16 << 20;
 
 fn socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("LAZYER_SOCKET") {
@@ -141,7 +143,22 @@ fn daemon() -> Result<()> {
         bail!("a daemon is already listening on {}", path.display());
     }
     let _ = std::fs::remove_file(&path);
+    // The socket accepts commands that change repositories: only the owner
+    // may reach it.
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
     let listener = UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // Remember which build this is, to step aside when it is replaced.
+    let exe = std::env::current_exe().ok();
+    let exe_stamp = |p: &Option<PathBuf>| -> Option<(std::time::SystemTime, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p.as_ref()?).ok()?;
+        Some((m.modified().ok()?, m.ino()))
+    };
+    let started_as = exe_stamp(&exe);
     let state = Arc::new(State {
         native: Native::new(),
         started: Instant::now(),
@@ -153,9 +170,12 @@ fn daemon() -> Result<()> {
     {
         let (state, path) = (state.clone(), path.clone());
         std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(60));
+            std::thread::sleep(Duration::from_secs(20));
             let idle = state.started.elapsed().as_millis() as u64 - state.last_request_ms.load(Ordering::Relaxed);
-            if idle > IDLE_EXIT.as_millis() as u64 {
+            // A rebuilt or reinstalled binary: end this one once it is quiet,
+            // the next request starts the new build.
+            let replaced = started_as.is_some() && exe_stamp(&exe) != started_as;
+            if idle > IDLE_EXIT.as_millis() as u64 || (replaced && idle > 3_000) {
                 let _ = std::fs::remove_file(&path);
                 std::process::exit(0);
             }
@@ -179,7 +199,11 @@ fn serve(mut s: UnixStream, state: &State, socket: &Path) -> Result<()> {
         if s.read_exact(&mut len).is_err() {
             return Ok(());
         }
-        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        let len = u32::from_be_bytes(len) as usize;
+        if len > MAX_REQUEST {
+            return Ok(());
+        }
+        let mut body = vec![0u8; len];
         s.read_exact(&mut body)?;
         let mut parts = body.split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string());
         let cwd = PathBuf::from(parts.next().unwrap_or_default());
@@ -202,7 +226,15 @@ fn serve(mut s: UnixStream, state: &State, socket: &Path) -> Result<()> {
                 let _ = std::fs::remove_file(socket);
                 std::process::exit(0);
             }
-            _ => state.native.emulate(&cwd, &argv).map(|e| (e.code, e.stdout)),
+            // A bug in answering one command must not take the daemon (and
+            // every other request) down: the command simply goes to git.
+            _ => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.native.emulate(&cwd, &argv))) {
+                Ok(answer) => answer.map(|e| (e.code, e.stdout)),
+                Err(_) => {
+                    eprintln!("panic while answering git {argv:?} in {}", cwd.display());
+                    None
+                }
+            },
         };
         if std::env::var_os("LAZYER_TRACE").is_some() {
             let shown: Vec<String> = argv.iter().map(|a| a.chars().take(48).collect()).collect();

@@ -39,6 +39,7 @@ update:
 disableStartupPopups: true
 gui:
   showRandomTip: false
+  showFileTree: false
 """
 
 
@@ -237,6 +238,22 @@ def drive_stage_all(lg, args):
     return lg.measure("a")  # stage all
 
 
+def drive_stage_line(lg, args):
+    lg.keys("2")        # files panel; the changed file is the first entry
+    lg.keys("\r")       # open it in the staging view
+    return lg.measure(" ")  # stage the selected line
+
+
+def drive_move_line_out(lg, args):
+    lg.keys("4")        # commits panel
+    lg.keys("jjj")      # the commit 3 below HEAD
+    lg.keys("\r")       # its files
+    lg.keys("\r")       # first file: patch building view
+    lg.keys(" ")        # add the selected line to the custom patch
+    lg.keys("\x10")     # ctrl+p: patch options
+    return lg.measure("i")  # move patch out into index
+
+
 def drive_amend_head(lg, args):
     lg.keys("2")
     lg.keys("A")        # amend last commit, asks for confirmation
@@ -260,11 +277,24 @@ SCENARIOS = [
     ("switch_far", "switch_far", drive_switch),
     ("stage_file", "status_dirty", drive_stage_file),
     ("stage_all", "status_dirty", drive_stage_all),
+    ("stage_line", "status_two_hunks", drive_stage_line),
+    ("move_line_out_of_commit", "move_patch_d3", drive_move_line_out),
     ("commit_staged", "commit_staged", drive_commit),
     ("amend_head", "amend_head", drive_amend_head),
     ("amend_older_d3", "amend_older_d3", drive_amend_older(3)),
     ("amend_older_d20", "amend_older_d20", drive_amend_older(20)),
 ]
+
+
+def state_summary(wt):
+    """What an operation leaves behind, without anything time-dependent:
+    the trees and subjects of recent commits, the index, and the status."""
+    return "\n".join([
+        git(wt, "log", "--format=%T %s", "-12"),
+        git(wt, "ls-files", "-s"),
+        git(wt, "status", "--porcelain"),
+        git(wt, "diff", "--cached"),
+    ])
 
 
 def main():
@@ -274,6 +304,7 @@ def main():
     ap.add_argument("--filter", default="")
     ap.add_argument("--shim", action="store_true", help="let lazygit use /usr/bin/git instead of the real binary")
     ap.add_argument("--debug", action="store_true", help="print the terminal text after each run")
+    ap.add_argument("--summary-dir", default="", help="write the repository state after each scenario there, to compare two binaries")
     ap.add_argument("--bin", default="lazygit", help="the lazygit binary to drive, e.g. target/lazygit-lazyer")
     a = ap.parse_args()
     global LAZYGIT_BIN
@@ -310,6 +341,10 @@ def main():
                     rows.append(drive(lg, args))
                     after = git(wt, "rev-parse", "HEAD") + git(wt, "symbolic-ref", "-q", "HEAD") + git(wt, "status", "--porcelain")
                     effect = "yes" if after != before else "NO"
+                if a.summary_dir:
+                    os.makedirs(a.summary_dir, exist_ok=True)
+                    with open(os.path.join(a.summary_dir, name + ".state"), "w") as f:
+                        f.write(state_summary(wt))
                 if a.debug:
                     print(lg.text()[-3000:], file=sys.stderr)
             finally:

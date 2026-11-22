@@ -80,6 +80,27 @@ fn commands() -> Vec<Vec<&'static str>> {
         vec!["rev-parse", "-q", "--verify", "refs/heads/main@{3}"],
         vec!["rev-parse", "-q", "--verify", "refs/heads/main@{50}"],
         vec!["rev-parse", "-q", "--verify", "refs/remotes/origin/main@{1}"],
+        // "?" first: the engine may decline (a commit that adds and deletes
+        // files could contain renames), but an answer has to be git's.
+        vec![
+            "?",
+            "-c",
+            "diff.dstPrefix=b/",
+            "-c",
+            "diff.srcPrefix=a/",
+            "-c",
+            "diff.noprefix=false",
+            "diff",
+            "--submodule",
+            "--no-ext-diff",
+            "--name-status",
+            "-z",
+            "--find-renames=50%",
+            "{oid}^",
+            "{oid}",
+        ],
+        vec!["?", "diff", "--submodule", "--no-ext-diff", "--name-status", "-z", "--find-renames=50%", "HEAD^", "HEAD"],
+        vec!["?", "diff", "--submodule", "--no-ext-diff", "--name-status", "-z", "--find-renames=50%", "{oid}", "HEAD"],
         vec!["config", "--get", "--null", "user.name"],
         vec!["config", "--get", "--null", "no.such-key"],
     ]
@@ -89,13 +110,14 @@ fn compare(native: &Native, wt: &Path, state: &str, failures: &mut Vec<String>) 
     let branch = run(wt, &["for-each-ref", "--count=1", "--format=%(refname:short)", "refs/heads/feature"]).unwrap();
     let oid = run(wt, &["rev-parse", "HEAD~2"]).unwrap();
     for template in commands() {
-        let argv: Vec<String> = template.iter().map(|a| a.replace("{branch}", &branch).replace("{oid}", &oid)).collect();
+        let optional = template[0] == "?";
+        let argv: Vec<String> = template.iter().skip(optional as usize).map(|a| a.replace("{branch}", &branch).replace("{oid}", &oid)).collect();
         let real = git(wt).args(&argv).stdin(std::process::Stdio::null()).output().unwrap();
         let shown = argv.iter().map(|a| a.chars().take(40).collect::<String>()).collect::<Vec<_>>().join(" ");
         match native.emulate(wt, &argv) {
             // Declining a command git itself rejects is fine: git then
             // reports the problem in its own words.
-            None if !real.status.success() => {}
+            None if !real.status.success() || optional => {}
             None => failures.push(format!("[{state}] not handled: git {shown}")),
             Some(e) => {
                 if e.code != real.status.code().unwrap_or(-1) {

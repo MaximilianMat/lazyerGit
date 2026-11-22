@@ -31,6 +31,7 @@ pub struct Settings {
     /// `core.excludesFile` or its default location.
     pub excludes_file: Option<PathBuf>,
     pub ignore_case: bool,
+    pub precompose_unicode: bool,
 }
 
 pub struct Repo<'a> {
@@ -262,7 +263,42 @@ impl Repo<'_> {
         // part of this: nothing else to do.
     }
 
+    /// Move the commit's changes to whole files out of it.
     pub fn move_patch_to_index(&self, commit: &str, paths: &[String], committer: &Ident) -> Result<()> {
+        self.move_out_of_commit(commit, committer, &|parent_tree, _| {
+            paths.iter().map(|p| Ok((p.as_bytes().to_vec(), lookup(self.odb, parent_tree, p.as_bytes())?))).collect()
+        })
+    }
+
+    /// Move selected hunks or lines out of the commit. `patch` is the
+    /// selection as a diff that, applied in reverse to the commit's files,
+    /// removes it (what lazygit hands to `git apply --reverse`).
+    pub fn move_patch_text_to_index(&self, commit: &str, patch: &[u8], committer: &Ident) -> Result<()> {
+        let files = super::patch::parse(patch)?;
+        self.move_out_of_commit(commit, committer, &|_, commit_tree| {
+            let mut wanted = Vec::new();
+            for f in &files {
+                if f.creates || f.deletes {
+                    return unsupported("patch adds or deletes a whole file");
+                }
+                let Some((mode, oid)) = lookup(self.odb, commit_tree, f.path.as_bytes())? else { return unsupported("patched file is not in the commit") };
+                if mode != super::index::MODE_FILE && mode != super::index::MODE_EXEC {
+                    return unsupported("patched path is not a regular file");
+                }
+                let (_, data) = self.odb.read(&oid)?;
+                let without = super::patch::apply(&data, &f.hunks, true)?;
+                wanted.push((f.path.as_bytes().to_vec(), Some((mode, self.odb.write(Kind::Blob, &without)?))));
+            }
+            Ok(wanted)
+        })
+    }
+
+    /// Rewrite `commit` so that the given paths have the given content
+    /// (`wanted` gets the trees of the commit's parent and of the commit),
+    /// replay the commits above it, and leave index and worktree alone: they
+    /// keep the old content, so what was taken out of the commit is staged.
+    #[allow(clippy::type_complexity)]
+    fn move_out_of_commit(&self, commit: &str, committer: &Ident, wanted: &dyn Fn(&Oid, &Oid) -> Result<Vec<(Vec<u8>, Option<(u32, Oid)>)>>) -> Result<()> {
         self.rewrite_preconditions()?;
         let commit = unhex(commit)?;
         let head = refs::read_head(&self.l)?;
@@ -280,22 +316,20 @@ impl Repo<'_> {
         let parent_tree = self.tree_of(&unhex(&old.parents[0])?)?;
         let old_tree = unhex(&old.tree)?;
         let mut new_tree = Some(old_tree);
-        for path in paths {
-            let p = path.as_bytes();
-            let before = lookup(self.odb, &parent_tree, p)?;
-            let after = lookup(self.odb, &old_tree, p)?;
+        for (p, slot) in wanted(&parent_tree, &old_tree)? {
+            let after = lookup(self.odb, &old_tree, &p)?;
             // The change has to arrive in index and worktree unaltered: no
             // later commit may have touched the file, and the file on disk
             // has to be the committed one.
-            if lookup(self.odb, &head_tree, p)? != after {
+            if lookup(self.odb, &head_tree, &p)? != after {
                 return unsupported("a later commit changes the same file");
             }
-            if let Ok(i) = index.find(p) {
+            if let Ok(i) = index.find(&p) {
                 if !super::checkout::entry_unchanged(&self.l.worktree, &index.entries[i], index_mtime)? {
                     return unsupported("the file has local changes");
                 }
             }
-            new_tree = with_path(self.odb, new_tree.as_ref(), p, before)?;
+            new_tree = with_path(self.odb, new_tree.as_ref(), &p, slot)?;
         }
         let new_tree = new_tree.unwrap_or(EMPTY_TREE);
         if new_tree == old_tree {
@@ -306,8 +340,6 @@ impl Repo<'_> {
         let (new_tip, _) = self.replay(&chain, rewritten_oid, new_tree, committer)?;
         refs::set_orig_head(&self.l, &tip)?;
         self.move_head(&head, &new_tip, committer, &format!("rebase (finish): move patch out of {}", &hex(&commit)[..7]))
-        // Index and worktree still hold the old HEAD's content, which now
-        // differs from the new HEAD by exactly the moved change: it is staged.
     }
 
     /// The checks and the plan for switching this worktree to `branch`.

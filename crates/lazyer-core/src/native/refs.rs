@@ -168,8 +168,9 @@ fn append_log(l: &Layout, name: &str, line: &str) -> Result<()> {
 }
 
 /// Replace a file the way git does: write `<file>.lock` exclusively, rename
-/// over the target. A lock held by another process is an error.
-fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
+/// over the target. A lock held by another process is an error. `check` runs
+/// while the lock is held and can still call the replacement off.
+fn replace_file_if(path: &Path, content: &[u8], check: impl FnOnce() -> Result<()>) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -178,32 +179,43 @@ fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
     let lock = PathBuf::from(lock);
     let mut f =
         std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).with_context(|| format!("{} is locked by another git process", path.display()))?;
-    let written = f.write_all(content);
-    drop(f);
-    if let Err(e) = written.and_then(|_| std::fs::rename(&lock, path)) {
+    let done = check().and_then(|_| Ok(f.write_all(content)?)).and_then(|_| {
+        drop(f);
+        Ok(std::fs::rename(&lock, path)?)
+    });
+    if done.is_err() {
         let _ = std::fs::remove_file(&lock);
-        return Err(e.into());
     }
-    Ok(())
+    done
+}
+
+fn replace_file(path: &Path, content: &[u8]) -> Result<()> {
+    replace_file_if(path, content, || Ok(()))
 }
 
 /// Point a branch (or other ref below `refs/`) at `new`. `expected` is what
 /// the ref must currently be; a concurrent change makes this fail.
 pub fn update_ref(l: &Layout, name: &str, new: &Oid, expected: Option<&Oid>, who: &Ident, message: &str) -> Result<()> {
-    let current = resolve(l, name)?;
-    if current.as_ref() != expected {
-        bail!("{name} changed underneath: expected {:?}, found {:?}", expected.map(hex), current.as_ref().map(hex));
-    }
-    replace_file(&l.ref_file(name), format!("{}\n", hex(new)).as_bytes())?;
+    // The comparison happens while the ref's lock is held, so a concurrent
+    // git cannot slip an update in between.
+    replace_file_if(&l.ref_file(name), format!("{}\n", hex(new)).as_bytes(), || {
+        let current = resolve(l, name)?;
+        if current.as_ref() != expected {
+            bail!("{name} changed underneath: expected {:?}, found {:?}", expected.map(hex), current.as_ref().map(hex));
+        }
+        Ok(())
+    })?;
     append_log(l, name, &reflog_line(expected, new, who, message))
 }
 
 /// Create a ref that must not exist yet, without a reflog (tags have none).
 pub fn create_ref(l: &Layout, name: &str, oid: &Oid) -> Result<()> {
-    if resolve(l, name)?.is_some() {
-        bail!("{name} already exists");
-    }
-    replace_file(&l.ref_file(name), format!("{}\n", hex(oid)).as_bytes())
+    replace_file_if(&l.ref_file(name), format!("{}\n", hex(oid)).as_bytes(), || {
+        if resolve(l, name)?.is_some() {
+            bail!("{name} already exists");
+        }
+        Ok(())
+    })
 }
 
 /// Record a movement of HEAD in its reflog. Used when the checked-out branch

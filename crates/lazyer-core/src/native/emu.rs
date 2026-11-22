@@ -43,7 +43,11 @@ impl Native {
                 // Settings that do not change the output of anything answered here.
                 Some("-c") => {
                     let kv = argv.get(i + 1)?.to_ascii_lowercase();
-                    if !["log.showsignature=false", "color.ui=false", "core.quotepath=false"].contains(&kv.as_str()) {
+                    // The diff.* ones only shape patch headers, which no
+                    // command answered here prints.
+                    if !["log.showsignature=false", "color.ui=false", "core.quotepath=false", "diff.dstprefix=b/", "diff.srcprefix=a/", "diff.noprefix=false"]
+                        .contains(&kv.as_str())
+                    {
                         return None;
                     }
                     i += 2;
@@ -79,6 +83,7 @@ impl Native {
             "log" => self.emu_log(r, shared, rest),
             "config" => emu_config(r, shared, rest),
             "reflog" => emu_reflog_show(r, rest),
+            "diff" => emu_name_status(r, rest),
             "rev-list" => self.emu_rev_list(r, shared, rest),
             "tag" if rest.first() == Some(&"--") && (rest.len() == 2 || rest.len() == 3) => {
                 // `git tag -- <name> [<ref>]`: a lightweight tag.
@@ -142,6 +147,32 @@ impl Native {
             "lazyer-amend-older" if rest.len() == 1 => {
                 let who = current_ident(shared)?;
                 self.amend_older(&r.l.worktree, rest[0], &who)?;
+                ok("")
+            }
+            "lazyer-move-patch-text" if rest.len() == 2 => {
+                let who = current_ident(shared)?;
+                let patch = std::fs::read(rest[1])?;
+                r.move_patch_text_to_index(rest[0], &patch, &who)?;
+                ok("")
+            }
+            "apply" => {
+                // `git apply --cached [--reverse] <file>`: stage or unstage
+                // selected hunks and lines.
+                let Some((file, flags)) = rest.split_last() else { return unsupported("apply form") };
+                let mut flags = flags.to_vec();
+                flags.sort();
+                let reverse = match flags.as_slice() {
+                    ["--cached"] => false,
+                    ["--cached", "--reverse"] => true,
+                    _ => return unsupported("apply form"),
+                };
+                let repo = shared.repo.to_thread_local();
+                let cfg = repo.config_snapshot();
+                // Whitespace fixing rewrites the lines being applied.
+                if cfg.string("apply.whitespace").is_some_and(|v| v != "warn" && v != "nowarn") || cfg.string("core.whitespace").is_some() {
+                    return unsupported("whitespace configuration");
+                }
+                r.apply_cached(&std::fs::read(file)?, reverse)?;
                 ok("")
             }
             "lazyer-move-patch" if rest.len() >= 2 => {
@@ -958,6 +989,53 @@ fn emu_config(r: &Repo, shared: &Shared, rest: &[&str]) -> Result<Emulated> {
         }
         None => Ok(Emulated { stdout: Vec::new(), code: 1 }),
     }
+}
+
+/// `git diff --submodule --no-ext-diff --name-status -z --find-renames=50%
+/// <from> <to>`: the files a commit changed, as lazygit lists them.
+fn emu_name_status(r: &Repo, rest: &[&str]) -> Result<Emulated> {
+    let ["--submodule", "--no-ext-diff", "--name-status", "-z", "--find-renames=50%", from, to] = rest else { return unsupported("diff form") };
+    let tree_of = |spec: &str| -> Result<Oid> {
+        let (name, parent) = match spec.strip_suffix('^') {
+            Some(n) => (n, true),
+            None => (spec, false),
+        };
+        let Some(mut commit) = resolve_commit(r, name)? else { return unsupported("unknown revision") };
+        if parent {
+            let (_, data) = r.odb.read(&commit)?;
+            let c = RawCommit::parse(&data)?;
+            // The parent of a root commit does not exist: git's to report.
+            let Some(p) = c.parents.first() else { return unsupported("root commit") };
+            commit = unhex(p)?;
+        }
+        let (_, data) = r.odb.read(&commit)?;
+        unhex(&RawCommit::parse(&data)?.tree)
+    };
+    let mut changes = Vec::new();
+    super::tree::diff_trees(r.odb, Some(&tree_of(from)?), Some(&tree_of(to)?), &mut changes)?;
+    // A deletion together with an addition may be shown as a rename, with a
+    // similarity score: that is git's call.
+    if changes.iter().any(|c| c.new.is_none()) && changes.iter().any(|c| c.old.is_none()) {
+        return unsupported("possible rename");
+    }
+    let kind = |mode: u32| mode & 0o170000;
+    let mut out = Vec::new();
+    for c in &changes {
+        let status = match (c.old, c.new) {
+            (Some((a, _)), Some((b, _))) if a == super::index::MODE_GITLINK || b == super::index::MODE_GITLINK => return unsupported("submodule"),
+            (Some((a, _)), Some((b, _))) if kind(a) != kind(b) => b'T',
+            (Some(_), Some(_)) => b'M',
+            (None, Some((m, _))) | (Some((m, _)), None) if m == super::index::MODE_GITLINK => return unsupported("submodule"),
+            (None, Some(_)) => b'A',
+            (Some(_), None) => b'D',
+            (None, None) => continue,
+        };
+        out.push(status);
+        out.push(0);
+        out.extend_from_slice(&c.path);
+        out.push(0);
+    }
+    ok(out)
 }
 
 /// Reflog of a ref as `(old id, new id, message)`, oldest first.

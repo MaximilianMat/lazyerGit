@@ -12,6 +12,7 @@ const NATIVE: &[&str] = &[
     "status_dirty",
     "status_changes",
     "status_rename",
+    "status_two_hunks",
     "view_main",
     "view_other_worktree",
     "view_merges",
@@ -93,4 +94,80 @@ fn swap_command_matches_the_script() {
         // A branch no other worktree holds is not this command's business.
         assert!(Native::isolated().emulate(&fb.repo, &["lazyer-swap-branch".to_string(), "no-such-branch".to_string()]).is_none());
     }
+}
+
+/// Moving one hunk of an older commit into the index has to end where the
+/// rebase lazygit drives ends: stop at the commit, take the hunk out, amend,
+/// continue, apply the hunk to the index.
+#[test]
+fn moving_a_hunk_out_of_a_commit_matches_the_rebase() {
+    use lazyer_testkit::differential::compared_worktrees;
+    use lazyer_testkit::git::{git, output, run};
+    use lazyer_testkit::scenario::committer;
+    use lazyer_testkit::snapshot::{differences, snapshot};
+    use lazyer_testkit::Fixture;
+
+    let profile = Profile::small();
+    let (fa, fb) = (Fixture::temp(&profile).unwrap(), Fixture::temp(&profile).unwrap());
+    let mut prepared = Vec::new();
+    for fx in [&fa, &fb] {
+        let wt = &fx.repo;
+        run(wt, &["checkout", "-q", "-b", "scenario/hunks"]).unwrap();
+        let files: Vec<String> = run(wt, &["ls-files", "--", "*.java"]).unwrap().lines().map(str::to_string).collect();
+        let target = files.iter().find(|f| std::fs::read_to_string(wt.join(f)).is_ok_and(|t| t.lines().count() >= 14)).unwrap().clone();
+        let others: Vec<&String> = files.iter().filter(|f| **f != target).take(3).collect();
+        // The commit to edit: two hunks in one file, plus another file.
+        let text = std::fs::read_to_string(wt.join(&target)).unwrap();
+        let mut ls: Vec<String> = text.lines().map(str::to_string).collect();
+        let n = ls.len();
+        ls[0] = "first line changed".into();
+        ls[n - 1] = "last line changed".into();
+        std::fs::write(wt.join(&target), ls.join("\n") + "\n").unwrap();
+        std::fs::write(wt.join(others[0]), "rewritten\n").unwrap();
+        run(wt, &["commit", "-q", "-am", "two hunks and another file"]).unwrap();
+        let commit = run(wt, &["rev-parse", "HEAD"]).unwrap();
+        for (i, f) in others[1..].iter().enumerate() {
+            std::fs::write(wt.join(f), format!("later {i}\n")).unwrap();
+            run(wt, &["commit", "-q", "-am", &format!("later {i}")]).unwrap();
+        }
+        // The selection: the second hunk of the target file.
+        let diff = run(wt, &["diff", &format!("{commit}^"), &commit, "--", &target]).unwrap() + "\n";
+        let first = diff.find("\n@@ ").unwrap() + 1;
+        let second = first + diff[first + 1..].find("\n@@ ").unwrap() + 2;
+        let patch = format!("{}{}", &diff[..first], &diff[second..]);
+        let file = fx.root.join("hunk.patch");
+        std::fs::write(&file, &patch).unwrap();
+        prepared.push((commit, patch, file));
+    }
+    assert_eq!(prepared[0].0, prepared[1].0);
+    let who = committer();
+
+    // Reference: the rebase.
+    let (commit, _, file) = &prepared[0];
+    let file = file.to_str().unwrap();
+    let step = |args: &[&str], editor: Option<&str>| {
+        let mut c = git(&fa.repo);
+        c.env("GIT_COMMITTER_DATE", who.git_date()).env("GIT_EDITOR", "true");
+        if let Some(e) = editor {
+            c.env("GIT_SEQUENCE_EDITOR", e);
+        }
+        output(c.args(args)).unwrap();
+    };
+    step(
+        &["rebase", "-q", "--interactive", "--autostash", "--keep-empty", "--no-autosquash", "--rebase-merges", &format!("{commit}^")],
+        Some("perl -pi -e 'if (!$done && s/^pick/edit/) { $done = 1 }'"),
+    );
+    step(&["apply", "--index", "--3way", "--reverse", file], None);
+    step(&["commit", "-q", "--amend", "--no-edit", "--allow-empty"], None);
+    step(&["rebase", "--continue"], None);
+    step(&["apply", "--index", "--3way", file], None);
+
+    // Candidate: the engine.
+    Native::isolated().move_patch_text_to_index(&fb.repo, &prepared[1].0, prepared[1].1.as_bytes(), &who).unwrap();
+
+    let a = snapshot(&fa.repo, &compared_worktrees(&profile, &fa)).unwrap();
+    let b = snapshot(&fb.repo, &compared_worktrees(&profile, &fb)).unwrap();
+    assert!(differences(&a, &b).is_empty(), "{:#?}", differences(&a, &b));
+    // The hunk is staged, the first one is still committed.
+    assert!(run(&fb.repo, &["diff", "--cached", "--stat"]).unwrap().contains("1 file changed"));
 }

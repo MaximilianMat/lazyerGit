@@ -226,6 +226,33 @@ impl Repo<'_> {
         self.store_index(&index, lock)
     }
 
+    /// `git apply --cached [--reverse] <patch>`: stage (or unstage) single
+    /// hunks and lines. Only the index changes.
+    pub fn apply_cached(&self, patch: &[u8], reverse: bool) -> Result<()> {
+        let files = super::patch::parse(patch)?;
+        let lock = IndexLock::acquire(&self.l)?;
+        let (mut index, _) = self.load_index()?;
+        if index.has_conflicts() {
+            return unsupported("unmerged entries in the index");
+        }
+        let mut wanted: Vec<(Vec<u8>, Slot)> = Vec::new();
+        for f in &files {
+            if f.creates || f.deletes {
+                return unsupported("patch adds or deletes a whole file");
+            }
+            let Ok(i) = index.find(f.path.as_bytes()) else { return unsupported("patched file is not tracked") };
+            let e = &index.entries[i];
+            if e.xflags != 0 || (e.mode != MODE_FILE && e.mode != MODE_EXEC) {
+                return unsupported("patched path is not a plain tracked file");
+            }
+            let (_, data) = self.odb.read(&e.oid)?;
+            let patched = super::patch::apply(&data, &f.hunks, reverse)?;
+            wanted.push((f.path.as_bytes().to_vec(), Some((e.mode, self.odb.write(Kind::Blob, &patched)?))));
+        }
+        self.set_entries(&mut index, &wanted)?;
+        self.store_index(&index, lock)
+    }
+
     /// `git rm --cached --force -- <files>`: forget files, keep them on disk.
     pub fn remove_cached(&self, paths: &[String]) -> Result<()> {
         let lock = IndexLock::acquire(&self.l)?;

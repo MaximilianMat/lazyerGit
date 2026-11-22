@@ -7,6 +7,7 @@ pub mod emu;
 pub mod index;
 pub mod odb;
 pub mod ops;
+pub mod patch;
 pub mod refs;
 pub mod similarity;
 pub mod stage;
@@ -127,6 +128,7 @@ impl Native {
             user,
             excludes_file,
             ignore_case: cfg.boolean("core.ignoreCase").unwrap_or(false),
+            precompose_unicode: cfg.boolean("core.precomposeUnicode").unwrap_or(false),
         }
     }
 
@@ -156,6 +158,7 @@ impl Native {
             head_tree,
             base_rules,
             ignore_case: shared.settings.ignore_case,
+            precompose_unicode: shared.settings.precompose_unicode,
             dir_cache: &dir_cache,
         })?;
         let mut st = Status { head_oid: head.oid().map(|o| tree::hex(&o)).unwrap_or_else(|| "(initial)".into()), entries, ..Default::default() };
@@ -201,6 +204,12 @@ impl Native {
             stashes: view::stashes(&r.l)?,
             worktrees: view::worktrees(&r.l)?,
         })
+    }
+
+    /// Move selected hunks or lines out of a commit into the index; see
+    /// [`Repo::move_patch_text_to_index`].
+    pub fn move_patch_text_to_index(&self, wt: &Path, commit: &str, patch: &[u8], committer: &Ident) -> Result<()> {
+        self.with_repo(wt, |r| r.move_patch_text_to_index(commit, patch, committer))
     }
 
     /// Everything of `load_view` except the file status, for when the status
